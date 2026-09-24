@@ -2,6 +2,8 @@
 machine. tests/test_mlx_model.py runs the same path against real weights."""
 import json as _json
 import time
+from collections import OrderedDict
+from types import SimpleNamespace
 import math
 from concurrent.futures import ThreadPoolExecutor
 
@@ -511,3 +513,65 @@ def test_a_one_token_reply_still_streams(tok, monkeypatch):
                           if line.startswith("data: ") and line.strip() != "data: [DONE]"]
             text = "".join(e["choices"][0]["delta"].get("content", "") for e in events if e["choices"])
             assert text == "7", (text, events)
+
+
+# --------------------------------------------------------- prefill cache budget
+
+class _FakePrompt:
+    """Enough of a prompt for _prefill: a cache key and a token count."""
+    def __init__(self, key, tokens):
+        self.key, self.tokens = key, tokens
+
+
+def _runtime(entries=12):
+    """An MlxRuntime without a model. __init__ loads 15 GB of weights on a
+    thread; the eviction rule under test touches none of it."""
+    from openjev.mlx_backend import MlxRuntime
+    rt = object.__new__(MlxRuntime)
+    rt.prefills = OrderedDict()
+    rt.prompt_cache_entries = entries
+    rt.model = SimpleNamespace(diffusion_prefill_cache=lambda **kw: object())
+    rt._inputs = lambda p: (p.key, {}, p.tokens)
+    return rt
+
+
+def test_many_short_prompts_cannot_pin_the_cache():
+    """THE REGRESSION. Against the token-only budget this keeps 400 entries.
+
+    Measured on the real model, that was ~30-50 MB each: 17 GB with the weights
+    loaded and nothing served, 27 GB after 360 unique short prompts, and 36 GB on
+    a real audit run - while the 16384-token budget was still two thirds unused,
+    because 400 prompts of 40 tokens is only 16000 tokens.
+    """
+    rt = _runtime(entries=12)
+    for i in range(400):
+        rt._prefill(_FakePrompt(f"k{i}", 40), max_tokens=32768)
+    assert len(rt.prefills) <= 12, (
+        f"{len(rt.prefills)} prefills retained; an entry costs KV cache, not "
+        "prompt tokens, so a token budget does not bound this")
+
+
+def test_the_newest_prompts_are_the_ones_kept():
+    rt = _runtime(entries=3)
+    for i in range(10):
+        rt._prefill(_FakePrompt(f"k{i}", 40), max_tokens=32768)
+    assert list(rt.prefills) == ["k7", "k8", "k9"]
+
+
+def test_a_repeated_prompt_is_a_hit_and_is_not_re_evicted():
+    """What the cache exists for: re-reads and samples share one prompt."""
+    rt = _runtime(entries=3)
+    for i in range(3):
+        rt._prefill(_FakePrompt(f"k{i}", 40), max_tokens=32768)
+    first = rt.prefills["k0"][0]
+    assert rt._prefill(_FakePrompt("k0", 40), max_tokens=32768)[0] is first
+    rt._prefill(_FakePrompt("k9", 40), max_tokens=32768)   # evicts the LRU, now k1
+    assert "k0" in rt.prefills and "k1" not in rt.prefills
+
+
+def test_long_prompts_are_still_bounded_by_tokens():
+    """The original guard must survive: few entries, each enormous."""
+    rt = _runtime(entries=12)
+    for i in range(6):
+        rt._prefill(_FakePrompt(f"big{i}", 8192), max_tokens=32768)
+    assert sum(t for _, t in rt.prefills.values()) <= 16384 + 8192

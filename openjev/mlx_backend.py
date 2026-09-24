@@ -19,14 +19,34 @@ done to the text it hands back.
 import asyncio
 import base64
 import hashlib
+import os
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
 from .engine import TOPK, Engine, SchemaError, slot_distribution
 
-# Re-reads and samples repeat a prompt exactly, so its prefill is cached, evicted by a
-# token budget (not entry count) so a few long prompts can't pin memory.
+# Re-reads and samples repeat a prompt exactly, so its prefill is cached.
+#
+# TWO BUDGETS, because the two ways to fill this cache cost memory differently.
+#
+# The token budget guards a few LONG prompts. It cannot guard many SHORT ones:
+# an entry's cost is the decoder and canvas KV cache, which barely depends on
+# the prompt's length, so counting prompt tokens badly under-counts memory. A
+# workload of short prompts - six questions per record over a batch of records
+# is the ordinary shape - accumulates hundreds of entries before a 16384-token
+# budget notices. Measured on an M4 Pro with the 4-bit 26B weights: 17 GB
+# resident with the model loaded and nothing served, then ~30-50 MB per unique
+# prompt, plateauing at 27 GB after 360 of them, while the token budget was
+# still only two thirds used. A real audit run reached 36 GB.
+#
+# The entry budget is the one that binds in practice. A dozen prefills is enough
+# for what the cache exists for - the re-reads and `samples` of one request share
+# a prompt - and costs a few hundred MB rather than tens of GB.
 PROMPT_CACHE_TOKENS = 16384
+PROMPT_CACHE_ENTRIES = int(os.environ.get("OPENJEV_MLX_PROMPT_CACHE", "12"))
+#: Ceiling on MLX's reusable buffer pool, in GB. 0 leaves it unbounded, which
+#: is the current behaviour and costs ~18 GB on this workload.
+CACHE_LIMIT_BYTES = int(float(os.environ.get("OPENJEV_MLX_CACHE_LIMIT_GB", "4")) * 1024**3)
 
 
 class ImagePrompt:
@@ -57,9 +77,10 @@ class MlxRuntime:
     """The model and the one thread that touches it. MLX work is kept off the
     event loop and on a single thread, from loading on."""
 
-    def __init__(self, model_path):
+    def __init__(self, model_path, prompt_cache_entries=None):
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="openjev-mlx")
         self.prefills = OrderedDict()
+        self.prompt_cache_entries = prompt_cache_entries or PROMPT_CACHE_ENTRIES
         self.pool.submit(self._load, model_path).result()
 
     def _load(self, model_path):
@@ -67,6 +88,13 @@ class MlxRuntime:
         from mlx_vlm import load
 
         self.mx = mx
+        # MLX keeps freed GPU buffers in a reusable pool and, unbounded, that pool
+        # grows to the peak working set and never shrinks. Measured on the 4-bit
+        # 26B weights serving the audit's shape (one choice question, six
+        # criteria): active 19.6 GB of live tensors against 18.5 GB of pool, for a
+        # 36.3 GB process. The pool is reuse, not data - capping it costs
+        # allocator churn and returns the rest to the machine.
+        mx.set_cache_limit(CACHE_LIMIT_BYTES)
         self.model, self.processor = load(model_path, trust_remote_code=False)
 
     def close(self):
@@ -102,7 +130,9 @@ class MlxRuntime:
         if hit is None:
             cache = self.model.diffusion_prefill_cache(**kwargs)
             self.prefills[key] = (cache, n)
-            while len(self.prefills) > 1 and sum(t for _, t in self.prefills.values()) > PROMPT_CACHE_TOKENS:
+            while len(self.prefills) > 1 and (
+                    len(self.prefills) > self.prompt_cache_entries
+                    or sum(t for _, t in self.prefills.values()) > PROMPT_CACHE_TOKENS):
                 self.prefills.popitem(last=False)
         else:
             cache = hit[0]
