@@ -202,7 +202,7 @@ Two backends serve the same `/v1/systemone`. Pick by hardware:
 
 | | vLLM (default) | MLX |
 |---|---|---|
-| Hardware | NVIDIA GPU, 24 GB or more | Apple silicon, about 16 GB free |
+| Hardware | NVIDIA GPU, 24 GB or more | Apple silicon, about 16 GB free to load; see [MLX memory](#mlx-memory) for what a served workload costs |
 | Setup | Docker image | `pip install -e '.[mlx]'` |
 | Reads | up to 64 in flight | one at a time |
 | `images` | yes | yes |
@@ -267,7 +267,8 @@ pip install -e path/to/openjev && python -m openjev
 
 A Mac needs no vLLM and no Docker. `OPENJEV_BACKEND=mlx` runs DiffusionGemma inside the OpenJev
 process through [MLX](https://github.com/ml-explore/mlx) and
-[mlx-vlm](https://github.com/Blaizzy/mlx-vlm). The 4-bit weights need about 16 GB of memory.
+[mlx-vlm](https://github.com/Blaizzy/mlx-vlm). The 4-bit weights need about 16 GB of
+memory to load, and **more than that in service** - see [MLX memory](#mlx-memory).
 
 ```bash
 pip install -e '.[mlx]'
@@ -293,6 +294,37 @@ weights. 16 concurrent requests finish at about 4 req/s.
 OPENJEV_MLX_TEST_MODEL=path/to/weights pytest tests/test_mlx_model.py   # tests against the real model
 ```
 
+### MLX memory
+
+Loading the 4-bit weights costs about 16 GB. A served workload costs more, and it
+is worth knowing why before sizing a machine.
+
+MLX keeps freed GPU buffers in a pool for reuse. Its default limit is the *memory*
+limit, so in practice the pool grows to the peak working set and never shrinks.
+Measured on an M4 Pro with 48 GB, serving one `choice` question with six criteria
+and roughly 850-token prompts:
+
+    reads=480  active=19.61G  cache=18.58G  peak=20.37G  prefills=12
+
+Half the process is pool - reuse, not data. `OPENJEV_MLX_CACHE_LIMIT_GB` caps it:
+
+| | baseline | after 150 reads | pool | p50 latency | 200 reads |
+|---|---|---|---|---|---|
+| unset | 16.6 GB | **36.2 GB** | 18.5 GB | 2076 ms | 415 s |
+| `=4` | 16.5 GB | **23.5 GB** | 4.3 GB | 2056 ms | 409 s |
+
+On that workload the cap cost nothing measurable and saved 12.8 GB, with
+byte-identical answers. It is **opt-in** rather than the default because that is one
+weight format on one machine size: with the 8-bit or bf16 weights the working set of
+a single read can exceed 4 GB, and a cap below it would return buffers to the OS on
+every read. If you set it, choose a value above your working set - the `cache`
+figure above, which `mx.get_cache_memory()` reports.
+
+`OPENJEV_MLX_PROMPT_CACHE` bounds a second, smaller thing. Prefills are also evicted
+on a 16384 prompt-token budget, and that budget cannot see many *short* prompts: an
+entry costs the decoder and canvas KV cache, which barely depends on prompt length,
+so 400 forty-token prompts are 16000 tokens - under budget - and all 400 are kept.
+
 ### Settings
 
 The server reads its settings from the environment.
@@ -304,6 +336,8 @@ The server reads its settings from the environment.
 | `OPENJEV_MODEL` | `nvidia/diffusiongemma-26B-A4B-it-NVFP4` | weights the built-in vLLM serves |
 | `OPENJEV_MLX_MODEL` | `mlx-community/diffusiongemma-26B-A4B-it-4bit` | MLX weights: a local directory or a Hugging Face id. Also supplies the tokenizer. `8bit` and `bf16` builds exist too. |
 | `OPENJEV_MLX_MAX_PROMPT` | `32768` | longest request, in tokens, before a 400 |
+| `OPENJEV_MLX_CACHE_LIMIT_GB` | unset | ceiling on MLX's reusable buffer pool, in GB. Unset leaves MLX's own default, which is the memory limit, so the pool grows to the peak working set and stays there. `0` **disables** the cache, which is the most allocator churn rather than the default. See [MLX memory](#mlx-memory) |
+| `OPENJEV_MLX_PROMPT_CACHE` | `12` | cached prefills, in entries. `0` keeps none. Bounds memory that the token budget cannot see: an entry costs KV cache, which barely depends on prompt length |
 | `OPENJEV_GPU_UTIL` | `0.9` | vLLM `--gpu-memory-utilization` |
 | `OPENJEV_MAX_NUM_SEQS` | `64` | vLLM `--max-num-seqs` |
 | `OPENJEV_MAX_MODEL_LEN` | `65536` | vLLM `--max-model-len` |

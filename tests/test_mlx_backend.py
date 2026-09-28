@@ -50,6 +50,13 @@ class StubRuntime:
         self.pool = ThreadPoolExecutor(max_workers=1)
         self.reads = []
         self.prefills = set()
+        # Part of the runtime protocol: MlxEngine applies both settings after it
+        # constructs the runtime, so the stub has to accept them too.
+        self.prompt_cache_entries = None
+        self.cache_limit_gb = "not set"
+
+    def set_cache_limit(self, gb):
+        self.cache_limit_gb = gb
         self.passes = 0
         self.generations = []
 
@@ -523,13 +530,14 @@ class _FakePrompt:
         self.key, self.tokens = key, tokens
 
 
-def _runtime(entries=12):
+def _runtime(entries=None):
     """An MlxRuntime without a model. __init__ loads 15 GB of weights on a
     thread; the eviction rule under test touches none of it."""
     from openjev.mlx_backend import MlxRuntime
     rt = object.__new__(MlxRuntime)
-    rt.prefills = OrderedDict()
-    rt.prompt_cache_entries = entries
+    rt.init_prefill_cache()          # the real defaults, not a hand copy
+    if entries is not None:
+        rt.prompt_cache_entries = entries
     rt.model = SimpleNamespace(diffusion_prefill_cache=lambda **kw: object())
     rt._inputs = lambda p: (p.key, {}, p.tokens)
     return rt
@@ -570,8 +578,109 @@ def test_a_repeated_prompt_is_a_hit_and_is_not_re_evicted():
 
 
 def test_long_prompts_are_still_bounded_by_tokens():
-    """The original guard must survive: few entries, each enormous."""
+    """The original guard must survive: few entries, each enormous.
+
+    Asserted against the budget itself, not the budget plus one entry. The looser
+    form passed even when a regression kept an extra 8192-token entry.
+    """
+    from openjev.mlx_backend import PROMPT_CACHE_TOKENS
     rt = _runtime(entries=12)
     for i in range(6):
         rt._prefill(_FakePrompt(f"big{i}", 8192), max_tokens=32768)
-    assert sum(t for _, t in rt.prefills.values()) <= 16384 + 8192
+    assert rt.prefill_tokens <= PROMPT_CACHE_TOKENS
+    assert len(rt.prefills) == 2, "16384 tokens holds exactly two 8192-token entries"
+
+
+def test_no_entry_is_exempt_from_eviction():
+    """The old rule kept one entry whatever its size, so a single prompt at
+    OPENJEV_MLX_MAX_PROMPT sat permanently at twice the token budget."""
+    from openjev.mlx_backend import PROMPT_CACHE_TOKENS
+    rt = _runtime(entries=12)
+    rt._prefill(_FakePrompt("huge", 32768), max_tokens=32768)
+    assert rt.prefill_tokens <= PROMPT_CACHE_TOKENS
+    assert rt.prefills == {}
+
+
+def test_zero_entries_turns_the_cache_off():
+    """0 must mean none. Under the old `> 1` guard it meant one."""
+    rt = _runtime(entries=0)
+    cache = rt._prefill(_FakePrompt("k0", 40), max_tokens=32768)[0]
+    assert rt.prefills == {} and rt.prefill_tokens == 0
+    assert cache is not None, "the caller still gets the prefill it asked for"
+
+
+def test_the_running_token_total_tracks_the_cache():
+    """The total is maintained on insert and eviction rather than re-summed, so
+    it can drift from the entries it claims to count."""
+    rt = _runtime(entries=3)
+    for i in range(10):
+        rt._prefill(_FakePrompt(f"k{i}", 40), max_tokens=32768)
+    assert rt.prefill_tokens == sum(t for _, t in rt.prefills.values())
+    assert rt.prefill_tokens == 3 * 40
+
+
+def test_the_default_entry_count_comes_from_the_module():
+    from openjev.mlx_backend import DEFAULT_PROMPT_CACHE_ENTRIES
+    rt = _runtime()
+    assert rt.prompt_cache_entries == DEFAULT_PROMPT_CACHE_ENTRIES
+
+
+# ------------------------------------------------- the settings and the wiring
+
+def _engine(tok, monkeypatch, **settings):
+    monkeypatch.setattr(mlx_backend, "MlxRuntime", StubRuntime)
+    with TestClient(create_app(Settings(backend="mlx", mlx_model="/models/dg", **settings),
+                               tokenizer=tok)) as c:
+        yield c.app.state.engine
+
+
+def test_mlx_engine_applies_both_settings_to_the_runtime(tok, monkeypatch):
+    """They are applied after construction, not passed to __init__, so that
+    StubRuntime's one-argument protocol still holds. Then they must actually
+    arrive - the runtime's own defaults would otherwise hide a broken wiring."""
+    eng = next(_engine(tok, monkeypatch, mlx_prompt_cache=5, mlx_cache_limit_gb=2.5))
+    assert eng.runtime.prompt_cache_entries == 5
+    assert eng.runtime.cache_limit_gb == 2.5
+
+
+def test_an_unset_cache_limit_still_reaches_the_runtime_as_none(tok, monkeypatch):
+    """None means "do not call mx.set_cache_limit". The runtime decides that, so
+    the engine must pass it through rather than skip the call."""
+    eng = next(_engine(tok, monkeypatch, mlx_cache_limit_gb=None))
+    assert eng.runtime.cache_limit_gb is None
+
+
+def test_a_zero_cache_limit_is_not_the_same_as_unset():
+    """0 DISABLES MLX's buffer cache; unset leaves MLX's own default alone. A
+    settings reader that treats "" and "0" alike loses that distinction."""
+    import os
+    from openjev.config import Settings as S
+    old = os.environ.get("OPENJEV_MLX_CACHE_LIMIT_GB")
+    try:
+        os.environ["OPENJEV_MLX_CACHE_LIMIT_GB"] = "0"
+        assert S().mlx_cache_limit_gb == 0.0
+        os.environ["OPENJEV_MLX_CACHE_LIMIT_GB"] = ""
+        assert S().mlx_cache_limit_gb is None
+    finally:
+        os.environ.pop("OPENJEV_MLX_CACHE_LIMIT_GB", None)
+        if old is not None:
+            os.environ["OPENJEV_MLX_CACHE_LIMIT_GB"] = old
+
+
+def test_a_bad_setting_names_itself():
+    """int(os.environ[...]) raises naming only the bad text, at import, so one
+    mistyped variable failed the service with a message that did not say which."""
+    import os, pytest
+    from openjev.config import Settings as S
+    for var, value, needle in (("OPENJEV_MLX_CACHE_LIMIT_GB", "4GB", "not a float"),
+                               ("OPENJEV_MLX_PROMPT_CACHE", "-3", "below the minimum")):
+        old = os.environ.get(var)
+        try:
+            os.environ[var] = value
+            with pytest.raises(ValueError) as e:
+                S()
+            assert var in str(e.value) and needle in str(e.value)
+        finally:
+            os.environ.pop(var, None)
+            if old is not None:
+                os.environ[var] = old
