@@ -1,0 +1,16 @@
+# Laya (laya-1.0), loaded in process with PyTorch. No vLLM. Build docker/Dockerfile.base first.
+#   docker build -f docker/Dockerfile.laya -t razorback16/openjev-laya .
+ARG BASE_IMAGE=razorback16/openjev-base:cu130-torch2.13
+FROM ${BASE_IMAGE}
+
+ENV OPENJEV_BACKEND=laya OPENJEV_HOST=0.0.0.0 OPENJEV_PORT=8080
+WORKDIR /app
+COPY pyproject.toml README.md ./
+COPY openjev ./openjev
+RUN uv pip install --python /opt/venv/bin/python --no-cache ".[laya]"
+
+EXPOSE 8080
+HEALTHCHECK --interval=15s --timeout=3s --start-period=300s \
+    CMD curl -sf http://127.0.0.1:8080/health || exit 1
+ENTRYPOINT []
+CMD ["python", "-m", "openjev"]

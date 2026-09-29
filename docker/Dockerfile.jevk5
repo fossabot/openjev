@@ -1,0 +1,38 @@
+# JevK5 (jevk5-0.2): vLLM serves alibiserikbay/JevK5 (Qwen3.5-4B, bf16) on 127.0.0.1:8000, and the
+# API server reads each question's answer letters from it. Build docker/Dockerfile.base first.
+#   docker build -f docker/Dockerfile.jevk5 -t razorback16/openjev-jevk5 .
+#
+# vLLM is the same commit as docker/Dockerfile's, without its DiffusionGemma patches: a read asks
+# for at most 16 letter ids, under upstream's cap of 128.
+ARG BASE_IMAGE=razorback16/openjev-base:cu130-torch2.13
+FROM ${BASE_IMAGE}
+
+ARG VLLM_REPO=https://github.com/vllm-project/vllm
+ARG VLLM_COMMIT=1b3b88ec2b7457aa030db4d0e7d8aaf04f6d0fb8
+# JevK5 0.2.2 (tag v0.2.2); not on PyPI
+ARG JEVK5_COMMIT=0571ef373722dd10cace82c81580d7b675fe6b53
+
+RUN git clone --filter=blob:none "$VLLM_REPO" /opt/vllm && git -C /opt/vllm checkout "$VLLM_COMMIT" \
+    && cd /opt/vllm && VLLM_USE_PRECOMPILED=1 VLLM_PRECOMPILED_WHEEL_COMMIT="$VLLM_COMMIT" \
+       uv pip install --python /opt/venv/bin/python . \
+    && rm -rf /root/.cache/uv
+# JevK5's prompt and its reading of more than 16 options (jevk5.prompt, standard library only).
+# Its own runtime's dependencies are not needed, and must not move vLLM's transformers.
+RUN uv pip install --python /opt/venv/bin/python --no-cache --no-deps \
+        "jevk5 @ git+https://github.com/allebee/jevk5@${JEVK5_COMMIT}"
+
+WORKDIR /app
+COPY pyproject.toml README.md ./
+COPY openjev ./openjev
+RUN uv pip install --python /opt/venv/bin/python --no-cache .
+COPY docker/entrypoint.sh /usr/local/bin/openjev-entrypoint
+
+# A read takes one greedy token and keeps only the letters' logprobs, so the sampler is never
+# the work. vLLM's own sampler needs no compiler; FlashInfer's compiles on first use and this
+# image has no nvcc.
+ENV VLLM_USE_FLASHINFER_SAMPLER=0
+ENV OPENJEV_BACKEND=jevk5 OPENJEV_UPSTREAM_MODEL=jevk5 OPENJEV_HOST=0.0.0.0 OPENJEV_PORT=8080
+EXPOSE 8080
+HEALTHCHECK --interval=15s --timeout=3s --start-period=600s \
+    CMD curl -sf http://127.0.0.1:8080/health || exit 1
+ENTRYPOINT ["openjev-entrypoint"]

@@ -1,0 +1,20 @@
+# The base of all three OpenJev images: CUDA runtime, Python 3.12 and PyTorch.
+#   docker build -f docker/Dockerfile.base -t razorback16/openjev-base:cu130-torch2.13 .
+# docker/Dockerfile (vLLM), Dockerfile.laya and Dockerfile.verdict start FROM it, so a
+# server that runs all three pulls and stores these layers (about 8.7 GB) once.
+# Tag it by what it holds, not by the OpenJev version: a new tag only when CUDA or torch moves.
+#
+# The CUDA base image carries only the driver shims. torch's wheel brings its own CUDA 13.0
+# libraries (kernels include sm_120, Blackwell) as nvidia-* packages.
+FROM nvidia/cuda:13.0.1-base-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive UV_LINK_MODE=copy PATH=/opt/venv/bin:$PATH \
+    UV_PYTHON_INSTALL_DIR=/opt/python PYTHONUNBUFFERED=1
+# gcc: Triton compiles a small C launcher for each kernel on first use
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git curl ca-certificates gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=ghcr.io/astral-sh/uv:0.8 /uv /usr/local/bin/uv
+# The version vLLM pins. The encoder models accept it too.
+RUN uv venv --python 3.12 /opt/venv \
+    && uv pip install --python /opt/venv/bin/python --no-cache torch==2.13.0

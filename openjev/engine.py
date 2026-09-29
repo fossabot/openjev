@@ -12,17 +12,27 @@ noise draws, a thought before the read, and sequential chunks. Left unset,
 a read behaves exactly as Jev's contract describes.
 """
 import asyncio
+import contextvars
 import json
 import math
 import random
+import time
 
 import httpx
+
+# Nanoseconds this request spent waiting on the model, including the wait for a
+# free slot. A contextvar holding a one-element list, not a number: a request's
+# reads run as tasks, and a task gets a *copy* of the context, so a rebound
+# value would never reach the request. Mutating the list the copy points at
+# does. api.py installs one per request; without it, this records nothing.
+model_ns = contextvars.ContextVar("model_ns", default=None)
 
 VOCAB = 262144
 TURN_CLOSE = 106
 PAD = 0
 TOPK = 20
-MAX_LABEL_IDS = 128  # vLLM's logprob_token_ids cap per request
+MAX_LABEL_IDS = 512  # vLLM's logprob_token_ids cap per request; the image raises it from 128
+MAX_CHOICES = 255  # Jev's limit on one choice's options
 SCAFFOLD_TEXT = "<|channel>thought\n<channel|>"  # the empty thought block the chat template leaves to the model
 
 # Answer template shapes: (join between questions, what precedes the label,
@@ -92,7 +102,7 @@ class Engine:
             if len(e) == len(base) and e[:-1] == base[:-1] and e[-1] not in seen:
                 seen.add(e[-1])
                 out.append(c)
-            if len(out) == MAX_LABEL_IDS:
+            if len(out) == MAX_CHOICES:
                 break
         return out
 
@@ -199,7 +209,10 @@ class Engine:
 
     def groups(self, qs, fmt):
         """Split questions, in order, into the fewest groups whose answer
-        templates fit the canvas."""
+        templates fit the canvas. One read's exact label ids are never the
+        binding limit: every question draws its labels from the same lists, so
+        a whole schema's union is at most 255 choice letters, ten score digits
+        and yes/no, well inside MAX_LABEL_IDS."""
         out, group = [], []
         for q in qs:
             trial = group + [q]
@@ -226,8 +239,16 @@ class Engine:
         return canvas
 
     async def _post(self, path, body):
-        async with self.slots:
-            r = await self.client.post(path, json=body)
+        started = time.perf_counter_ns()
+        try:
+            async with self.slots:
+                r = await self.client.post(path, json=body)
+        finally:
+            # Reads of one request run concurrently, so this sums to more than
+            # the wall clock. It is model time spent, not model time elapsed.
+            spent = model_ns.get()
+            if spent is not None:
+                spent[0] += time.perf_counter_ns() - started
         if 400 <= r.status_code < 500:
             try:
                 msg = r.json().get("error", {}).get("message") or r.json().get("message") or r.text
@@ -238,16 +259,28 @@ class Engine:
         return r.json()
 
     def _xargs(self, template, slots, seed, steps):
-        return {"diffusion_seed_canvas": self.build_canvas(template, slots, seed),
-                "diffusion_canvas_length": self.canvas_width(template),
-                "diffusion_max_steps": steps, "diffusion_read_only": True}
+        width = self.canvas_width(template)
+        xargs = {"diffusion_seed_canvas": self.build_canvas(template, slots, seed),
+                 "diffusion_canvas_length": width,
+                 "diffusion_max_steps": steps, "diffusion_read_only": True}
+        if steps > 1:
+            # Past one step, accept/renoise rewrites whatever it did not pin, so
+            # hold every position but the answer slots at the seeded template.
+            free = {s["pos"] for s in slots}
+            xargs["diffusion_pinned"] = [p for p in range(width) if p not in free]
+        return xargs
 
     async def one_read(self, template, slots, sys_text, content, seed, steps=1, prefix=None):
         """One read-only denoise over a seeded canvas. ``content`` is the user
         turn: the state text, or image parts followed by it. With ``prefix``
         (prompt token ids that already hold a thought or earlier answers) the
         read continues that prompt through the completions endpoint instead."""
-        label_ids = sorted({i for s in slots for i in s["label_ids"]})[:MAX_LABEL_IDS]
+        label_ids = sorted({i for s in slots for i in s["label_ids"]})
+        if len(label_ids) > MAX_LABEL_IDS:
+            # groups() splits ahead of this; a read that still asks for more
+            # would get silently truncated evidence, so refuse it instead.
+            raise SchemaError(f"the questions of one read need {len(label_ids)} label tokens; "
+                              f"a read allows {MAX_LABEL_IDS}. Ask them in separate requests.")
         if prefix is not None:
             d = await self._post("/v1/completions", {
                 "model": self.s.upstream_model, "prompt": prefix, "max_tokens": len(template) + 1,
