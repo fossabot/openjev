@@ -7,6 +7,29 @@ def _env(name, default):
     return os.environ.get(name, default)
 
 
+def _env_num(name, cast, default=None, minimum=None):
+    """A numeric setting, or `default` when unset or empty.
+
+    `int(os.environ[...])` raises a ValueError naming only the offending text,
+    at import time, so one mistyped variable fails the whole service with a
+    message that does not say which variable was wrong. Naming it costs a line.
+
+    `None` means unset, and is distinct from a valid `0`: a cache limit of 0
+    disables MLX's buffer cache, which is a real choice and not the same as
+    leaving the limit alone.
+    """
+    raw = _env(name, "")
+    if raw == "":
+        return default
+    try:
+        value = cast(raw)
+    except ValueError:
+        raise ValueError(f"{name}={raw!r} is not a {cast.__name__}") from None
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{name}={value} is below the minimum of {minimum}")
+    return value
+
+
 @dataclass(frozen=True)
 class Settings:
     upstream: str = field(default_factory=lambda: _env("OPENJEV_UPSTREAM", "http://127.0.0.1:8000"))
@@ -15,6 +38,15 @@ class Settings:
     backend: str = field(default_factory=lambda: _env("OPENJEV_BACKEND", "vllm"))
     mlx_model: str = field(default_factory=lambda: _env("OPENJEV_MLX_MODEL", "mlx-community/diffusiongemma-26B-A4B-it-4bit"))
     mlx_max_prompt: int = field(default_factory=lambda: int(_env("OPENJEV_MLX_MAX_PROMPT", "32768")))
+    # MLX buffer pool ceiling, in GB. Unset leaves MLX alone, whose own default
+    # is the memory limit. 0 DISABLES the cache, which is the worst allocator
+    # churn rather than the old behaviour - see mlx_backend.apply_mlx_settings.
+    mlx_cache_limit_gb: float | None = field(
+        default_factory=lambda: _env_num("OPENJEV_MLX_CACHE_LIMIT_GB", float, minimum=0))
+    # Prefill cache size in ENTRIES. See mlx_backend.PROMPT_CACHE_TOKENS for why
+    # entries as well as tokens: an entry costs KV cache, not prompt length.
+    mlx_prompt_cache: int = field(
+        default_factory=lambda: _env_num("OPENJEV_MLX_PROMPT_CACHE", int, default=12, minimum=0))
     canvas: int = field(default_factory=lambda: int(_env("OPENJEV_CANVAS", "64")))
     canvas_step: int = field(default_factory=lambda: int(_env("OPENJEV_CANVAS_STEP", "16")))
     max_inflight: int = field(default_factory=lambda: int(_env("OPENJEV_MAX_INFLIGHT", "64")))

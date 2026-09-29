@@ -19,14 +19,34 @@ done to the text it hands back.
 import asyncio
 import base64
 import hashlib
+import os
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
 from .engine import TOPK, Engine, SchemaError, slot_distribution
 
-# Re-reads and samples repeat a prompt exactly, so its prefill is cached, evicted by a
-# token budget (not entry count) so a few long prompts can't pin memory.
+# Re-reads and samples repeat a prompt exactly, so its prefill is cached.
+#
+# TWO BUDGETS, because the two ways to fill this cache cost memory differently.
+#
+# The token budget guards a few LONG prompts. It cannot guard many SHORT ones:
+# an entry's cost is the decoder and canvas KV cache, which barely depends on
+# the prompt's length, so counting prompt tokens badly under-counts memory. A
+# workload of short prompts - six questions per record over a batch of records
+# is the ordinary shape - accumulates hundreds of entries before a 16384-token
+# budget notices. Measured on an M4 Pro with the 4-bit 26B weights: 17 GB
+# resident with the model loaded and nothing served, then ~30-50 MB per unique
+# prompt, plateauing at 27 GB after 360 of them, while the token budget was
+# still only two thirds used. A real audit run reached 36 GB.
+#
+# The entry budget is the one that binds in practice. A dozen prefills is enough
+# for what the cache exists for - the re-reads and `samples` of one request share
+# a prompt - and costs a few hundred MB rather than tens of GB.
 PROMPT_CACHE_TOKENS = 16384
+#: Default prefill entries when nothing configures the runtime. Settings
+#: (config.mlx_prompt_cache) is the real source; this keeps a bare
+#: MlxRuntime(path) usable, which the tests rely on.
+DEFAULT_PROMPT_CACHE_ENTRIES = 12
 
 
 class ImagePrompt:
@@ -59,7 +79,7 @@ class MlxRuntime:
 
     def __init__(self, model_path):
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="openjev-mlx")
-        self.prefills = OrderedDict()
+        self.init_prefill_cache()
         self.pool.submit(self._load, model_path).result()
 
     def _load(self, model_path):
@@ -93,6 +113,40 @@ class MlxRuntime:
                   "attention_mask": inputs.get("attention_mask")}
         return prompt.key, kwargs, int(ids.shape[-1])
 
+    def init_prefill_cache(self):
+        """The prefill cache's own state, in one place.
+
+        Separate from __init__ so a test can have the real defaults without
+        loading 15 GB of weights - otherwise a test that reconstructs this state
+        by hand silently stops testing the defaults the moment one changes.
+        """
+        self.prefills = OrderedDict()
+        self.prompt_cache_entries = DEFAULT_PROMPT_CACHE_ENTRIES
+        #: Running total of the cached prefills' tokens, kept in step with
+        #: `prefills` on insert and eviction rather than re-summed per pass.
+        self.prefill_tokens = 0
+
+    def set_cache_limit(self, gb):
+        """Cap MLX's reusable buffer pool, in GB. None leaves MLX alone.
+
+        MLX keeps freed GPU buffers in a pool for reuse. Its own default limit is
+        the MEMORY limit, so in practice the pool grows to the peak working set
+        and never shrinks: measured on the 4-bit 26B weights serving one choice
+        question with six criteria, active memory was 19.6 GB of live tensors
+        against 18.5 GB of pool, for a 36.3 GB process. A 4 GB cap gave 23.5 GB
+        with byte-identical answers.
+
+        `gb=0` DISABLES the cache - every freed buffer goes back to the OS. That
+        is the worst allocator churn, not a way back to the default, which is why
+        unset (None) means "do not call" rather than "no limit".
+
+        Runs on the one MLX thread, like every other call into mx.
+        """
+        if gb is None:
+            return None
+        limit = int(gb * 1024 ** 3)
+        return self.pool.submit(lambda: self.mx.set_cache_limit(limit)).result()
+
     def _prefill(self, prompt, max_tokens):
         key, kwargs, n = self._inputs(prompt)
         # an image prompt's length is only known here, after the processor expanded it
@@ -102,8 +156,17 @@ class MlxRuntime:
         if hit is None:
             cache = self.model.diffusion_prefill_cache(**kwargs)
             self.prefills[key] = (cache, n)
-            while len(self.prefills) > 1 and sum(t for _, t in self.prefills.values()) > PROMPT_CACHE_TOKENS:
-                self.prefills.popitem(last=False)
+            self.prefill_tokens += n
+            # No entry is exempt. The previous rule kept one whatever its size,
+            # so a single prompt at OPENJEV_MLX_MAX_PROMPT sat permanently at
+            # twice the token budget, and neither 0 nor 1 could turn the cache
+            # off. Evicting the entry just inserted is safe: `cache` is already
+            # bound and is returned to the caller.
+            while self.prefills and (
+                    len(self.prefills) > self.prompt_cache_entries
+                    or self.prefill_tokens > PROMPT_CACHE_TOKENS):
+                _, (_, evicted) = self.prefills.popitem(last=False)
+                self.prefill_tokens -= evicted
         else:
             cache = hit[0]
             self.prefills.move_to_end(key)
@@ -198,6 +261,11 @@ class MlxEngine(Engine):
     def __init__(self, settings, tokenizer):
         super().__init__(settings, tokenizer)
         self.runtime = MlxRuntime(settings.mlx_model)
+        # Applied after construction, not passed in: tests substitute StubRuntime
+        # for MlxRuntime and it takes one argument, with a comment saying the stub
+        # must speak the same protocol.
+        self.runtime.prompt_cache_entries = settings.mlx_prompt_cache
+        self.runtime.set_cache_limit(settings.mlx_cache_limit_gb)
 
     async def close(self):
         await super().close()

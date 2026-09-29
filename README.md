@@ -186,7 +186,7 @@ Two backends serve the same `/v1/systemone`. Select one by hardware:
 
 | | vLLM (default) | MLX |
 |---|---|---|
-| Hardware | NVIDIA GPU, 24 GB or more | Apple silicon, about 16 GB free |
+| Hardware | NVIDIA GPU, 24 GB or more | Apple silicon, about 16 GB free (more in service, see [MLX memory](#mlx-memory)) |
 | Setup | Docker image | `pip install -e '.[mlx]'` |
 | Reads | up to 64 in flight | one at a time |
 | `images`, `steps` > 1, `think` | yes | yes |
@@ -267,7 +267,8 @@ checkout. Without it, vLLM prefills images causally.
 
 A Mac needs no vLLM and no Docker. `OPENJEV_BACKEND=mlx` runs DiffusionGemma inside the OpenJev
 process through [MLX](https://github.com/ml-explore/mlx) and
-[mlx-vlm](https://github.com/Blaizzy/mlx-vlm). The 4-bit weights need about 16 GB of memory.
+[mlx-vlm](https://github.com/Blaizzy/mlx-vlm). The 4-bit weights need about 16 GB of memory
+to load, and more in service (see [MLX memory](#mlx-memory)).
 
 ```bash
 pip install -e '.[mlx]'
@@ -282,6 +283,16 @@ prompt tokens. The re-reads and `samples` of one request share one vision pass.
 Reads run one at a time, so this backend is for local use, not for serving. A 3-question request
 takes about 0.2–0.4 s on an M3 Ultra and about 0.39 s on an M4 Max, both with the 4-bit weights.
 16 concurrent requests finish at about 4 req/s.
+
+### MLX memory
+
+Loading the 4-bit weights costs about 16 GB. In service, MLX keeps freed GPU buffers in a pool
+that grows to the peak working set. On an M4 Pro with 48 GB, one workload grew from 16.6 GB to
+36.2 GB. With `OPENJEV_MLX_CACHE_LIMIT_GB=4` it stayed at 23.5 GB, with the same answers and
+speed. The limit is off by default, because with the 8-bit or bf16 weights one read can need more
+than 4 GB. If you set it, use a value above your working set.
+
+`OPENJEV_MLX_PROMPT_CACHE` sets the number of cached prefills (default 12).
 
 ### Small encoder models
 
@@ -481,6 +492,8 @@ The server reads its settings from the environment.
 | `OPENJEV_MODEL` | `nvidia/diffusiongemma-26B-A4B-it-NVFP4` | weights for the built-in vLLM. `Qwen/Qwen3-8B-FP8` for `clm`, `alibiserikbay/JevK5` for `jevk5` |
 | `OPENJEV_MLX_MODEL` | `mlx-community/diffusiongemma-26B-A4B-it-4bit` | MLX weights: a local directory or a Hugging Face id. Also gives the tokenizer. `8bit` and `bf16` builds are also available. |
 | `OPENJEV_MLX_MAX_PROMPT` | `32768` | longest request, in tokens, before a 400 |
+| `OPENJEV_MLX_CACHE_LIMIT_GB` | unset | limit on the MLX buffer pool, in GB. Unset keeps the MLX default. `0` disables the pool. See [MLX memory](#mlx-memory) |
+| `OPENJEV_MLX_PROMPT_CACHE` | `12` | cached prefills, in entries. `0` keeps none |
 | `OPENJEV_GPU_UTIL` | `0.9` | vLLM `--gpu-memory-utilization`. `0.85` for `clm` and `jevk5` |
 | `OPENJEV_MAX_NUM_SEQS` | `64` | vLLM `--max-num-seqs` |
 | `OPENJEV_MAX_MODEL_LEN` | `65536` | vLLM `--max-model-len`. `2048` for `clm`, `16384` for `jevk5` |
