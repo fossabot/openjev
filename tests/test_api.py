@@ -180,6 +180,9 @@ def test_confidence():
     assert confidence([0.5, 0.5]) == pytest.approx(0.0)
     # matches Jev's documented example (0.84/0.159/0.001 -> ~0.596)
     assert confidence([0.84, 0.159, 0.001]) == pytest.approx(0.596, abs=0.01)
+    # one option is fully certain; before the fix this divided by ln(1)=0
+    assert confidence([1.0]) == 1.0
+    assert confidence([]) == 0.0
 
 
 def test_answer_shapes_roundtrip():
