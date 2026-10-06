@@ -180,6 +180,21 @@ merged on 2026-09-22. It adds seeded canvases, read-only steps, step caps and pi
 positions for DiffusionGemma. `openjev/engine.py` adapts that PR's `structured_server.py`
 example, with async I/O, bounded concurrency and backpressure.
 
+Since 0.6.0 the image pins upstream vLLM main at
+[`a3e0243b`](https://github.com/vllm-project/vllm/commit/a3e0243b1c3ea313b902a43b0f6559fb4148ff81)
+(2026-10-06), which has every DiffusionGemma change merged after #57250:
+
+| PR | Change |
+|---|---|
+| [#58216](https://github.com/vllm-project/vllm/pull/58216) | Constrained reads: a read can score only its label tokens. OpenJev sends it when `OPENJEV_CONSTRAINED=1` ([Settings](#settings)). |
+| [#58226](https://github.com/vllm-project/vllm/pull/58226) | One-pass kernel for the sampler statistics |
+| [#51994](https://github.com/vllm-project/vllm/pull/51994) | The attention mask no longer freezes under CUDA graph replay |
+| [#48521](https://github.com/vllm-project/vllm/pull/48521) | The LM head gets the checkpoint's quantization config |
+
+On 2,501 labeled text questions (choice and yes/no) the answers are as accurate as on 0.5.0's
+pin: 76.7% against 77.0%, a difference within run-to-run noise. Images and scores were not
+re-measured.
+
 ## Run your own
 
 Two backends serve the same `/v1/systemone`. Select one by hardware:
@@ -225,22 +240,53 @@ docker compose build
 vLLM listens only inside the container.
 Set `OPENJEV_UPSTREAM` to use a vLLM server that you already run.
 
-Measured on an RTX PRO 6000 at 38% of the GPU, with 3 questions per request and cache-busted
-states:
+Throughput depends on the state length: a read prefills the whole prompt, so prompt tokens
+are the main cost. Measured with [`scripts/bench.py`](scripts/bench.py) on OpenJev 0.6.0, on an
+RTX PRO 6000 Blackwell, in codiv's production setup: this image's defaults
+(`--max-model-len 65536 --max-num-seqs 64`, canvas 64, `OPENJEV_MAX_INFLIGHT=64`) plus
+`OPENJEV_VLLM_ARGS="--kv-cache-memory-bytes 45097156608"`, a fixed 42 GiB KV cache of about 1.2M
+tokens. The compose file here leaves that out and gives vLLM 90% of the GPU instead. Each request asks the three
+questions of the [example](#try-it) with default settings, so automatic re-reads are on.
 
-| Concurrency | req/s | p50 | p95 |
-|---:|---:|---:|---:|
-| 1 | 10.7 | 94 ms | 94 ms |
-| 16 | 43.3 | 367 ms | 369 ms |
-| 32 | 51.7 | 545 ms | 618 ms |
-| 64 | 57.4 | 760 ms | 1109 ms |
+Every state starts with a random nonce. vLLM's prefix cache matches from the first token, so no
+request reuses another's prefill: these are full prefills, the worst case. The long states are
+shuffled paragraphs of this README and the license, cut to the token count with the server's
+tokenizer. "Prompt tokens billed" is the request's `usage.input_tokens`: the state plus the
+questions and the prompt template. Requests per level are `2 x concurrency` (at least 16) for
+the short states and `1 x concurrency` (at least 8) for 32K and 64K. The server was serving
+codiv.ai's light production traffic (about 2 req/s) at the same time.
 
-One request at a time, on the same GPU, with `samples: 1`:
+| State tokens | Prompt tokens billed | Concurrency | Requests | req/s | p50 | p95 | Errors |
+|---:|---:|---:|---:|---:|---:|---:|---|
+| 49 | 200 | 1 | 16 | 21.9 | 30 ms | 76 ms | 0 |
+| 49 | 200 | 16 | 32 | 81.0 | 163 ms | 283 ms | 0 |
+| 49 | 200 | 32 | 64 | 108.7 | 246 ms | 472 ms | 0 |
+| 49 | 200 | 64 | 128 | 129.7 | 331 ms | 669 ms | 0 |
+| 2,047 | 2,198 | 1 | 16 | 10.2 | 83 ms | 150 ms | 0 |
+| 2,047 | 2,198 | 16 | 32 | 17.7 | 793 ms | 1,268 ms | 0 |
+| 2,047 | 2,198 | 32 | 64 | 18.5 | 1,485 ms | 2,719 ms | 0 |
+| 2,047 | 2,198 | 64 | 128 | 18.6 | 2,912 ms | 5,389 ms | 0 |
+| 8,191 | 8,342 | 1 | 16 | 3.2 | 307 ms | 334 ms | 0 |
+| 8,191 | 8,342 | 16 | 32 | 3.7 | 4,168 ms | 5,664 ms | 0 |
+| 8,191 | 8,342 | 32 | 64 | 3.8 | 7,431 ms | 10,304 ms | 0 |
+| 8,191 | 8,342 | 64 | 128 | 3.8 | 15,404 ms | 23,197 ms | 0 |
+| 32,767 | 32,918 | 1 | 8 | 0.6 | 1,700 ms | 2,046 ms | 0 |
+| 32,767 | 32,918 | 16 | 16 | 0.6 | 16,287 ms | 25,189 ms | 0 |
+| 32,767 | 32,918 | 32 | 32 | 0.6 | 27,279 ms | 50,346 ms | 0 |
+| 32,767 | 32,918 | 64 | 64 | 0.6 | 61,865 ms | 101,745 ms | 0 |
+| 63,999 | 64,150 | 1 | 8 | 0.2 | 4,785 ms | 5,114 ms | 0 |
+| 63,999 | 64,150 | 16 | 16 | 0.2 | 52,018 ms | 69,056 ms | 0 |
+| 63,999 | 64,150 | 32 | 32 | 0.2 | 68,987 ms | 121,612 ms | 503: 4 |
+| 63,999 | 64,150 | 64 | 64 | 0.2 | 73,345 ms | 125,971 ms | 503: 37 |
 
-| Request | p50 | p95 |
-|---|---:|---:|
-| 1 question | 27 ms | 28 ms |
-| 3 questions | 31 ms | 32 ms |
+- Up to about 2K tokens, more concurrency buys throughput. Past that, the GPU is busy
+  prefilling: throughput stays at about 40K prompt tokens/s at 2K tokens, falls to about 31K at
+  8K and 13K at 64K (attention grows with the square of the length), and extra concurrency only
+  adds queueing.
+- A 64K-token read alone takes about 5 s. At 32 or more concurrent 64K reads, some wait more
+  than 120 s for vLLM and return `503` with `retry-after`, which is the server's overload answer.
+- To reproduce: `python scripts/bench.py --url http://127.0.0.1:8080` (see the script's
+  docstring for the options; pass `--key` if the server wants one).
 
 Without Docker:
 
@@ -250,6 +296,8 @@ VLLM_COMMIT=a3e0243b1c3ea313b902a43b0f6559fb4148ff81   # the commit the image pi
 git checkout $VLLM_COMMIT
 # a choice of more than 128 options needs a larger cap, as in the image
 sed -i 's/^MAX_LOGPROB_TOKEN_IDS = 128$/MAX_LOGPROB_TOKEN_IDS = 512/' vllm/sampling_params.py
+# bidirectional attention inside each image, as in the image
+python path/to/openjev/docker/patches/vision_prefix_lm.py vllm/model_executor/models/diffusion_gemma.py
 VLLM_USE_PRECOMPILED=1 VLLM_PRECOMPILED_WHEEL_COMMIT=$VLLM_COMMIT pip install -e .
 vllm serve nvidia/diffusiongemma-26B-A4B-it-NVFP4 --served-model-name dgemma \
   --diffusion-config '{"canvas_length": 64}' --max-logprobs 32 --enable-prefix-caching \
@@ -279,6 +327,10 @@ This backend uses the same prompts, canvases and seeds as vLLM. It supports `ima
 `samples`, `sequential`, `steps`, `think` and the automatic re-reads, and it bills the same.
 Each step after the first reuses one prefill of the prompt. More steps cost GPU time, not
 prompt tokens. The re-reads and `samples` of one request share one vision pass.
+
+Requests are limited to 32,768 tokens by default, half the 65,536 that vLLM serves. Set
+`OPENJEV_MLX_MAX_PROMPT=65536` for the full window, if the Mac has the memory for it: a longer
+prompt needs more KV cache and a larger prefill, and we have not measured that.
 
 Reads run one at a time, so this backend is for local use, not for serving. A 3-question request
 takes about 0.2–0.4 s on an M3 Ultra and about 0.39 s on an M4 Max, both with the 4-bit weights.
@@ -491,7 +543,7 @@ The server reads its settings from the environment.
 | `OPENJEV_UPSTREAM` | unset | external vLLM server URL. When set, the container does not start its own |
 | `OPENJEV_MODEL` | `nvidia/diffusiongemma-26B-A4B-it-NVFP4` | weights for the built-in vLLM. `Qwen/Qwen3-8B-FP8` for `clm`, `alibiserikbay/JevK5` for `jevk5` |
 | `OPENJEV_MLX_MODEL` | `mlx-community/diffusiongemma-26B-A4B-it-4bit` | MLX weights: a local directory or a Hugging Face id. Also gives the tokenizer. `8bit` and `bf16` builds are also available. |
-| `OPENJEV_MLX_MAX_PROMPT` | `32768` | longest request, in tokens, before a 400 |
+| `OPENJEV_MLX_MAX_PROMPT` | `32768` | longest request, in tokens, before a 400. Half the vLLM window; `65536` for the full one |
 | `OPENJEV_MLX_CACHE_LIMIT_GB` | unset | limit on the MLX buffer pool, in GB. Unset keeps the MLX default. `0` disables the pool. See [MLX memory](#mlx-memory) |
 | `OPENJEV_MLX_PROMPT_CACHE` | `12` | cached prefills, in entries. `0` keeps none |
 | `OPENJEV_GPU_UTIL` | `0.9` | vLLM `--gpu-memory-utilization`. `0.85` for `clm` and `jevk5` |
@@ -521,7 +573,7 @@ The server reads its settings from the environment.
     255 options.
   - `docker/patches/vision_prefix_lm.py` gives image tokens bidirectional attention, as the
     checkpoint config asks. Upstream vLLM does this for Gemma4 but not yet for DiffusionGemma.
-- The `clm` and `jevk5` images pin the same vLLM commit with neither change.
+- The `clm` and `jevk5` images still pin 0.5's vLLM commit (`1b3b88ec`), with neither change.
 - Answer quality is the quality of DiffusionGemma 26B-A4B in this mode. Evaluate it on your own
   tasks before you rely on it.
 
