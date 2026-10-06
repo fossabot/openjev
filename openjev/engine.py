@@ -432,8 +432,14 @@ def slot_distribution(top, label_ids):
 
 
 def confidence(p):
-    """How peaked a distribution is: 1 - H(p)/ln(K). 1 is certain, 0 uniform."""
+    """How peaked a distribution is: 1 - H(p)/ln(K). 1 is certain, 0 uniform.
+
+    A single outcome is fully certain (1.0); an empty distribution has no peak (0.0).
+    Both used to divide by ln(K)=0 and raise ZeroDivisionError.
+    """
     k = len(p)
+    if k <= 1:
+        return 1.0 if k == 1 else 0.0
     h = -sum(x * math.log(x) for x in p if x > 0)
     return max(0.0, min(1.0, 1.0 - h / math.log(k)))
 
