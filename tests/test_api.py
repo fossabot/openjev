@@ -82,6 +82,15 @@ def test_widest_schema_fits_one_read_of_label_ids(tok):
     assert len(labels) == 255 + 10 + 2 <= MAX_LABEL_IDS
 
 
+
+def test_constrained_reads_are_opt_in(tok):
+    """diffusion_constrained changes what a slot's entropy measures, so it is sent
+    only when OPENJEV_CONSTRAINED asks for it."""
+    template, slots = [0] * 8, [{"pos": 2, "label_ids": [5, 6]}]
+    assert "diffusion_constrained" not in Engine(Settings(), tok)._xargs(template, slots, 0, 1)
+    xargs = Engine(Settings(constrained=True), tok)._xargs(template, slots, 0, 1)
+    assert xargs["diffusion_constrained"] is True
+
 def test_choice_limit_is_jevs(tok):
     eng = Engine(Settings(), tok)
     with pytest.raises(SchemaError) as excinfo:

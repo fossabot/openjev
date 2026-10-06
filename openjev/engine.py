@@ -263,6 +263,8 @@ class Engine:
         xargs = {"diffusion_seed_canvas": self.build_canvas(template, slots, seed),
                  "diffusion_canvas_length": width,
                  "diffusion_max_steps": steps, "diffusion_read_only": True}
+        if self.s.constrained:
+            xargs["diffusion_constrained"] = True
         if steps > 1:
             # Past one step, accept/renoise rewrites whatever it did not pin, so
             # hold every position but the answer slots at the seeded template.

@@ -3,17 +3,18 @@
 # docker/Dockerfile.laya and docker/Dockerfile.verdict.
 #   docker build -f docker/Dockerfile -t razorback16/openjev .
 #
-# PR #57250 merged on 2026-09-22, carrying the two sampler fixes we ran on a fork
-# (eager fallback past torch.compile's recompile limit; logprob stashes of
-# different widths), so the pin is upstream's own merge commit. Its image-input
-# fix came in separately, as #57589. The commit has a published wheel, so the
-# compiled kernels are downloaded rather than built: no CUDA build here.
+# Upstream main as of 2026-10-06, the newest commit with a published wheel, so the
+# compiled kernels are downloaded rather than built: no CUDA build here. Since the
+# #57250 merge it adds the DiffusionGemma fixes and speedups: constrained reads
+# (#58216), a one-pass sampler statistics kernel (#58226), quant_config on the LM
+# head (#48521), and an attention mask that no longer freezes under CUDA graph
+# replay (#51994). Neither patch below is upstream yet; both still apply here.
 ARG BASE_IMAGE=razorback16/openjev-base:cu130-torch2.13
 FROM ${BASE_IMAGE}
 
 ARG VLLM_REPO=https://github.com/vllm-project/vllm
-ARG VLLM_COMMIT=1b3b88ec2b7457aa030db4d0e7d8aaf04f6d0fb8
-ARG VLLM_BASE_COMMIT=1b3b88ec2b7457aa030db4d0e7d8aaf04f6d0fb8
+ARG VLLM_COMMIT=a3e0243b1c3ea313b902a43b0f6559fb4148ff81
+ARG VLLM_BASE_COMMIT=a3e0243b1c3ea313b902a43b0f6559fb4148ff81
 
 # FlashInfer compiles its NVFP4 MoE kernels with nvcc on first start. This is the
 # subset of the CUDA toolkit upstream vLLM's own image installs for that, rather

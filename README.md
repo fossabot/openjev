@@ -211,7 +211,7 @@ Or without compose:
 
 ```bash
 docker run -d --gpus all --ipc=host -p 127.0.0.1:8080:8080 \
-  -v ~/.cache/huggingface:/root/.cache/huggingface razorback16/openjev:0.5.0
+  -v ~/.cache/huggingface:/root/.cache/huggingface razorback16/openjev:0.6.0
 ```
 
 The first start downloads the weights (about 18 GB) into `~/.cache/huggingface`. To build the
@@ -246,7 +246,7 @@ Without Docker:
 
 ```bash
 git clone https://github.com/vllm-project/vllm && cd vllm
-VLLM_COMMIT=1b3b88ec2b7457aa030db4d0e7d8aaf04f6d0fb8   # the commit the image pins
+VLLM_COMMIT=a3e0243b1c3ea313b902a43b0f6559fb4148ff81   # the commit the image pins
 git checkout $VLLM_COMMIT
 # a choice of more than 128 options needs a larger cap, as in the image
 sed -i 's/^MAX_LOGPROB_TOKEN_IDS = 128$/MAX_LOGPROB_TOKEN_IDS = 512/' vllm/sampling_params.py
@@ -499,6 +499,7 @@ The server reads its settings from the environment.
 | `OPENJEV_MAX_MODEL_LEN` | `65536` | vLLM `--max-model-len`. `2048` for `clm`, `16384` for `jevk5` |
 | `OPENJEV_VLLM_ARGS` | unset | extra `vllm serve` flags |
 | `OPENJEV_CANVAS` | `64` | canvas length. Also sets the built-in vLLM's `--diffusion-config` |
+| `OPENJEV_CONSTRAINED` | `0` | `1` sends vLLM's `diffusion_constrained`: a read scores only its label tokens, which is faster. Probabilities are normalized over the labels, so the uncertainty that triggers re-reads is measured differently |
 | `OPENJEV_MAX_INFLIGHT` | `64` | reads in flight to vLLM |
 | `OPENJEV_MAX_QUEUE` | `512` | waiting decisions before the server returns 529 |
 | `OPENJEV_MAX_QUESTIONS` | `256` | questions per request, before a 400 |
