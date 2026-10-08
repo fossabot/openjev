@@ -1,4 +1,6 @@
 # OpenJev
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fpnerger-ssnc%2Fopenjev.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2Fpnerger-ssnc%2Fopenjev?ref=badge_shield)
+
 
 **Fast, calibrated, typed decisions from an open model.** OpenJev is an open-source
 "System One" decision server. Send it a state and typed questions (yes/no, choice, score). It
@@ -567,3 +569,6 @@ option, images, chat, and the encoder models that the server lists.
 Apache-2.0. The DiffusionGemma weights are Apache-2.0 (NVIDIA / Google). Laya
 (Nandakishor M / Convai Innovations) and Verdict (Heman10x) are Apache-2.0, weights and code.
 `openjev/encoders.py` adapts Verdict's prompt format and calibration from its repository.
+
+
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fpnerger-ssnc%2Fopenjev.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2Fpnerger-ssnc%2Fopenjev?ref=badge_large)
